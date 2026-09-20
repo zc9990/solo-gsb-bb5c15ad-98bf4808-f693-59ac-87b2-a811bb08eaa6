@@ -155,6 +155,46 @@ class ImpactPreview(StrictModel):
         return v
 
 
+# ---------------------------------------------------------------- 跨文档依赖锁定包
+
+
+class LockBundleRoot(StrictModel):
+    """锁定包的单个根文档：文档 ID 与 ``current`` 或正整数修订号。"""
+
+    document_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._~-]*$",
+        description="根文档 ID",
+    )
+    revision: Any = Field(
+        ...,
+        description="根文档修订：正整数修订号或字符串 \"current\"（固定为快照内当前修订）",
+    )
+
+    @field_validator("revision")
+    @classmethod
+    def _revision_spec(cls, v: Any) -> Any:
+        # 严格判定：bool 是 int 子类需排除；"1" 之类的数字串不做隐式转换
+        if isinstance(v, bool):
+            raise ValueError('revision 必须是正整数修订号或 "current"')
+        if isinstance(v, int) and v >= 1:
+            return v
+        if isinstance(v, str) and v == "current":
+            return v
+        raise ValueError('revision 必须是正整数修订号或 "current"')
+
+
+class LockBundleRequest(StrictModel):
+    roots: list[LockBundleRoot] = Field(
+        ...,
+        min_length=1,
+        max_length=20,
+        description="需要锁定依赖闭包的根文档列表（1～20 个；按 文档+修订 去重）",
+    )
+
+
 class SetContract(StrictModel):
     # JSON Schema 根必须是对象或布尔（true/false 布尔 Schema）；
     # 进一步的合法性（关键字、$ref 等）由 validation.check_schema 做元校验。

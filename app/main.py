@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 
 from . import db
 from .blame import RevisionSnapshot, compute_blame
+from .bundle import lock_bundle
 from .config import settings
 from .diff import OPS, snapshot_diff
 from .guards import check_guards
@@ -29,6 +30,7 @@ from .schemas import (
     CreateRelease,
     Guard,
     ImpactPreview,
+    LockBundleRequest,
     ReleaseLease,
     RenewLease,
     RevertDocument,
@@ -47,13 +49,14 @@ async def lifespan(app: FastAPI) -> Iterator[None]:
 
 app = FastAPI(
     title="共享 JSON 配置三方合并 API",
-    version="1.8.0",
+    version="1.9.0",
     description="基于 JSON Merge Patch (RFC 7386) 的共享配置存储；"
     "基线过期时递归三方合并，路径冲突返回 409；支持按修订号逆向撤销；"
     "支持任意两修订间的递归差异审计；"
     "支持历史字段归因（目标快照每个叶子值最后由哪次修订改变）；"
     "支持跨文档 $ref 引用解析（同一读事务快照内固定全部修订）；"
     "支持变更影响预演（不落库候选 + 各根文档当前/候选解析对比，只读）；"
+    "支持跨文档依赖锁定包（@current 固定为数字修订，闭包去重 + 稳定排序 + bundle_digest，只读）；"
     "支持更新前置条件 guards（写事务内先检查当前修订，未满足返回 409）；"
     "支持文档级临时写入租约（fencing token 全局严格递增，过期后旧 token 永久失效）。",
     lifespan=lifespan,
@@ -831,6 +834,43 @@ def impact_preview(
         "candidate": candidate,
         "results": results,
     }
+
+
+# ---------------------------------------------------------------- 跨文档依赖锁定包
+
+
+@app.post("/bundles/lock", tags=["bundles"])
+def lock_bundle_route(
+    body: LockBundleRequest, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """跨文档依赖锁定包：把各根文档的 ``$ref`` 依赖闭包固定为数字修订（只读）。
+
+    * 接收 1～20 个根文档，每个根的 ``revision`` 为 ``"current"`` 或正整数；
+    * 全程在**同一个 SQLite 读事务快照**内遍历各固定快照中符合现有语法的
+      ``$ref``：``@current`` 固定为当次快照所见的数字修订，数字引用保持不变，
+      递归收集依赖并按 **文档+修订** 去重；依赖成环不是错误（环上目标只遍历一次）；
+    * 响应返回改写后的根列表（``current`` 已固定为数字修订）、全部**原始**
+      文档快照（按文档、修订排序）与依赖边（按文档、修订、指针位置排序，
+      含改写后的 ``locked_ref``）；
+    * ``bundle_digest`` 为上述规范化 JSON 的 SHA-256：根输入顺序不同但
+      依赖闭包相同的请求得到相同摘要；
+    * 文档 / 修订 / 指针不存在 → ``422`` 及从根文档出发的完整引用链；
+      本接口为只读，不产生任何写入。
+    """
+    roots = [(item.document_id, item.revision) for item in body.roots]
+
+    # 只读事务（WAL 快照）：全部根与 @current 引用见到的修订相互固定，且不写入
+    with db.read_transaction(conn):
+        try:
+            result = lock_bundle(
+                roots,
+                lambda target: _current_revision_or_none(conn, target),
+                lambda target, rev: _revision_content_or_none(conn, target, rev),
+            )
+        except ResolutionError as exc:
+            raise err(exc.status_code, exc.code, chain=exc.chain, **exc.extra)
+
+    return result
 
 
 # ---------------------------------------------------------------- 契约（JSON Schema 2020-12）

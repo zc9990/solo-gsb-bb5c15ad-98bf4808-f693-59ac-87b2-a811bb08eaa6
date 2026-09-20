@@ -156,6 +156,7 @@ docker compose down -v       # 停止并删除数据卷
 | `GET` | `/documents/{id}/blame` | 历史字段归因（`revision` 指定目标快照）：每个叶子值最后由哪次修订改变 |
 | `GET` | `/documents/{id}/resolved` | 跨文档引用解析（`revision` 可选，默认 `current`），返回 `resolved` 与去重依赖清单 |
 | `POST` | `/documents/{id}/impact-preview` | 变更影响预演（只读）：生成不落库候选，对比各根文档当前 / 候选两遍解析结果 |
+| `POST` | `/bundles/lock` | 跨文档依赖锁定包（只读）：1～20 个根文档，`@current` 固定为数字修订，返回闭包快照 / 依赖边与 `bundle_digest` |
 | `PUT` | `/documents/{id}/schema` | 设置 / 替换 JSON Schema 2020-12 契约 |
 | `GET` | `/documents/{id}/schema` | 查询当前契约（未设置返回 `404 schema_not_found`） |
 | `DELETE` | `/documents/{id}/schema` | 删除契约（幂等，删除后恢复原更新行为） |
@@ -920,6 +921,100 @@ curl -X POST http://localhost:8000/documents/dep/impact-preview \
 - 预演为**只读**分析：不创建修订、不占用 `request_id`、不改变租约，
   也不检查租约与 guards；同一预演重复执行不会产生任何副作用。
 
+## 跨文档依赖锁定包（POST /bundles/lock）
+
+只读接口：接收 **1～20 个根文档**（每个根给 `document_id` 与
+`revision`：正整数修订号或 `"current"`），在**同一个 SQLite 读事务快照**内
+遍历各固定快照中符合现有语法的 `$ref`（引用形态与
+[`/resolved`](#跨文档引用解析get-documentsidresolved) 完全一致），
+把一份"依赖闭包 + 锁定引用"打包返回：
+
+- `@current` 固定为**当次快照所见的数字修订**，`@<正整数>` 数字引用保持不变；
+- 递归收集被引用文档的固定快照，按 **文档 + 修订** 去重；
+- 依赖成环**不是错误**（锁定只需完整闭包，不需无环展开）：环上每个
+  (文档, 修订, 指针) 目标只遍历一次，边照常记录；
+- `roots` / `documents` / `edges` 均按文档、修订、指针稳定排序；
+- `bundle_digest` 为这三部分规范化 JSON（紧凑、键排序）的 SHA-256——
+  **根输入顺序不同但依赖闭包相同的请求得到相同摘要**。
+
+```bash
+# base: {"host": "db.internal", "port": 5432}（当前 rev1）
+# app:  {"database": {"$ref": "doc:base@current#"}, "debug": false}
+curl -X POST http://localhost:8000/bundles/lock \
+  -H 'Content-Type: application/json' \
+  -d '{"roots":[{"document_id": "app", "revision": "current"}]}'
+```
+
+```json
+{
+  "roots": [
+    {"document_id": "app", "revision": 1}
+  ],
+  "documents": [
+    {"document_id": "app", "revision": 1,
+     "content": {"database": {"$ref": "doc:base@current#"}, "debug": false}},
+    {"document_id": "base", "revision": 1,
+     "content": {"host": "db.internal", "port": 5432}}
+  ],
+  "edges": [
+    {"document_id": "app", "revision": 1, "at": "/database",
+     "ref": "doc:base@current#",
+     "target_document_id": "base", "target_revision": 1, "pointer": "",
+     "locked_ref": "doc:base@1#"}
+  ],
+  "bundle_digest": "58fa2dcc…ab78c"
+}
+```
+
+响应字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `roots` | 改写后的入参根列表（`current` 已固定为数字修订），按文档、修订排序、去重 |
+| `documents` | 闭包内全部**原始**文档快照（引用**不展开**），按文档、修订排序，按 文档+修订 去重 |
+| `edges` | 依赖边，按源文档、修订、指针位置排序：`at` 为引用在源快照中的 RFC 6901 位置，`ref` 为原始引用串，`target_document_id` / `target_revision` / `pointer` 为固定后的目标，`locked_ref` 为改写后的引用串（可直接回填到原位置） |
+| `bundle_digest` | `sha256(canonical({roots, documents, edges}))`；只依赖闭包内容，与根输入顺序无关 |
+
+多个根可一次锁定；同一 (文档, 修订) 被多个根引用时快照只出现一次，
+但来自不同源位置的边都会保留：
+
+```bash
+curl -X POST http://localhost:8000/bundles/lock \
+  -H 'Content-Type: application/json' \
+  -d '{"roots":[
+        {"document_id": "app",  "revision": "current"},
+        {"document_id": "jobs", "revision": 3}
+      ]}'
+```
+
+### 锁定失败：422 与完整引用链
+
+根或被引用的文档 / 修订 / 指针不存在（指针转义非法同样视为不可解析）时
+返回 `422`，`chain` 给出从某个根文档出发的**完整引用链**
+（每项含 `document_id` / `revision` / `pointer` / `ref` / `at`）：
+
+```json
+HTTP/1.1 422 Unprocessable Entity
+{
+  "detail": {
+    "error": "document_not_found",
+    "document_id": "ghost",
+    "reason": "被引用文档不存在",
+    "chain": [
+      {"document_id": "bad",   "revision": 1,    "pointer": "",
+       "ref": null, "at": null},
+      {"document_id": "ghost", "revision": null, "pointer": "/a",
+       "ref": "doc:ghost@current#/a", "at": "/v"}
+    ]
+  }
+}
+```
+
+同类错误还有 `revision_not_found`（根或被引用的指定修订不存在，含
+`current_revision`）、`pointer_not_found`（指针在目标修订中不存在或转义非法）。
+`revision` 不是正整数或 `"current"`、根数量不在 1～20、存在额外字段等
+请求体问题返回框架级 `422`。锁定为**只读**：失败与成功都不产生任何写入。
+
 ## JSON Schema 契约（可选）
 
 每个文档最多一个契约，遵循 [JSON Schema 2020-12](https://json-schema.org/draft/2020-12)
@@ -1066,18 +1161,22 @@ HTTP/1.1 422 Unprocessable Entity
 | `422 revision_not_found` | 引用解析中指定修订不存在（含完整引用链） |
 | `422 pointer_not_found` | 引用解析中指针在目标修订中不存在或转义非法（含完整引用链） |
 | `422 max_depth_exceeded` | 引用解析深度超过 32（含完整引用链） |
+| `422 document_not_found`（bundles） | 依赖锁定中（根或被引用的）文档不存在（含完整引用链，不产生写入） |
+| `422 revision_not_found`（bundles） | 依赖锁定中根或被引用的指定修订不存在（含完整引用链，不产生写入） |
+| `422 pointer_not_found`（bundles） | 依赖锁定中指针在目标修订中不存在或转义非法（含完整引用链，不产生写入） |
 
 ## 项目结构
 
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由与更新编排（事务、幂等、guards、写入租约、冲突响应、契约接口、差异审计、字段归因、引用解析、变更影响预演）
+│   ├── main.py        # FastAPI 路由与更新编排（事务、幂等、guards、写入租约、冲突响应、契约接口、差异审计、字段归因、引用解析、变更影响预演、依赖锁定包）
 │   ├── merge.py       # RFC 7386 打补丁 + 递归三方合并（无框架依赖，可单测）
 │   ├── guards.py      # 更新前置条件求值（RFC 6901 指针 + 等值/缺失检查，无框架依赖，可单测）
 │   ├── diff.py        # 两快照递归差异审计（add/remove/replace，无框架依赖，可单测）
 │   ├── blame.py       # 历史字段归因（叶子值最后变更归属，无框架依赖，可单测）
 │   ├── resolve.py     # 跨文档 $ref 引用递归解析（环检测、深度上限，无框架依赖，可单测）
+│   ├── bundle.py      # 跨文档依赖锁定包（@current 固定数字修订、闭包去重、稳定排序 + SHA-256 摘要，无框架依赖，可单测）
 │   ├── validation.py  # JSON Schema 2020-12 元校验与实例校验（错误稳定排序）
 │   ├── db.py          # SQLite 连接、自动建表、文档/修订/幂等/契约/发布/租约表读写、读写事务
 │   ├── schemas.py     # Pydantic 请求模型（额外字段拒绝）
@@ -1092,6 +1191,7 @@ HTTP/1.1 422 Unprocessable Entity
 │   ├── test_blame.py     # GET /documents/{id}/blame 历史字段归因集成测试（24 例）
 │   ├── test_resolve.py   # GET /documents/{id}/resolved 引用解析集成测试（33 例）
 │   ├── test_impact_preview.py # POST /documents/{id}/impact-preview 变更影响预演集成测试（24 例）
+│   ├── test_bundles.py # POST /bundles/lock 跨文档依赖锁定包集成测试（27 例）
 │   ├── test_guards.py    # guards 前置条件与发布项 guards 集成测试（27 例）
 │   └── test_leases.py    # 写入租约（获取/续期/释放/查询 + PATCH/发布门禁）集成测试（29 例）
 ├── Dockerfile
