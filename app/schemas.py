@@ -172,6 +172,45 @@ class SetContract(StrictModel):
         return v
 
 
+# ---------------------------------------------------------------- 跨文档依赖锁定包
+
+
+class BundleRoot(StrictModel):
+    """锁定包的根文档：``revision`` 为正整数修订号或 ``current``（省略时默认 current）。"""
+
+    document_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._~-]*$",
+        description="根文档 ID",
+    )
+    revision: Any = Field(
+        default="current",
+        description="根文档修订：正整数修订号或 current（默认 current）",
+    )
+
+    @field_validator("revision")
+    @classmethod
+    def _valid_revision(cls, v: Any) -> Any:
+        if v == "current":
+            return v
+        if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+            raise ValueError("revision 必须是正整数修订号或 current")
+        return v
+
+
+class LockBundle(StrictModel):
+    """跨文档依赖锁定包：只读接口，把根文档及其 $ref 依赖闭包固定为快照包。"""
+
+    roots: list[BundleRoot] = Field(
+        ...,
+        min_length=1,
+        max_length=20,
+        description="根文档列表（1～20 个；固定修订后按 文档+修订 去重）",
+    )
+
+
 # ---------------------------------------------------------------- 原子发布
 
 

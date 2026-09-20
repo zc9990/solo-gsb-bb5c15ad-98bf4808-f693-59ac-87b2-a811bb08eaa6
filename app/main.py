@@ -1,4 +1,4 @@
-"""FastAPI 入口：文档创建 / 读取 / 修订历史 / 修订差异 / 字段归因 / 引用解析 / 变更影响预演 / 带三方合并的更新 / 写入租约。"""
+"""FastAPI 入口：文档创建 / 读取 / 修订历史 / 修订差异 / 字段归因 / 引用解析 / 变更影响预演 / 依赖锁定包 / 带三方合并的更新 / 写入租约。"""
 from __future__ import annotations
 
 import hashlib
@@ -11,7 +11,7 @@ from typing import Any, Iterator
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 
-from . import db
+from . import bundle, db
 from .blame import RevisionSnapshot, compute_blame
 from .config import settings
 from .diff import OPS, snapshot_diff
@@ -29,6 +29,7 @@ from .schemas import (
     CreateRelease,
     Guard,
     ImpactPreview,
+    LockBundle,
     ReleaseLease,
     RenewLease,
     RevertDocument,
@@ -47,13 +48,15 @@ async def lifespan(app: FastAPI) -> Iterator[None]:
 
 app = FastAPI(
     title="共享 JSON 配置三方合并 API",
-    version="1.8.0",
+    version="1.9.0",
     description="基于 JSON Merge Patch (RFC 7386) 的共享配置存储；"
     "基线过期时递归三方合并，路径冲突返回 409；支持按修订号逆向撤销；"
     "支持任意两修订间的递归差异审计；"
     "支持历史字段归因（目标快照每个叶子值最后由哪次修订改变）；"
     "支持跨文档 $ref 引用解析（同一读事务快照内固定全部修订）；"
     "支持变更影响预演（不落库候选 + 各根文档当前/候选解析对比，只读）；"
+    "支持跨文档依赖锁定包（同一读事务内固定根与依赖闭包的全部修订，"
+    "输出排序稳定的快照包与 bundle_digest，只读）；"
     "支持更新前置条件 guards（写事务内先检查当前修订，未满足返回 409）；"
     "支持文档级临时写入租约（fencing token 全局严格递增，过期后旧 token 永久失效）。",
     lifespan=lifespan,
@@ -830,6 +833,51 @@ def impact_preview(
         "changed": changed,
         "candidate": candidate,
         "results": results,
+    }
+
+
+# ---------------------------------------------------------------- 跨文档依赖锁定包
+
+
+@app.post("/bundles/lock", tags=["bundles"])
+def lock_bundle(
+    body: LockBundle, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """跨文档依赖锁定包：把 1～20 个根文档及其 $ref 依赖闭包固定为快照包（只读）。
+
+    * 全程在**同一 SQLite 读事务快照**内：根文档与所有 ``@current`` 引用固定为
+      当次快照所见的数字修订，数字引用保持不变；
+    * 闭包按**整篇快照**遍历：每个 (文档, 修订) 进入闭包后，其内容中所有符合
+      现有引用语法的 ``$ref`` 都被校验并记录为依赖边，目标随之进入闭包，
+      按 (文档, 修订) 去重；依赖成环只是闭包中的普通边，不视为错误；
+    * 响应返回改写后根列表、全部原始文档快照与依赖边，均按
+      (文档, 修订, 指针) 稳定排序；``bundle_digest`` 为三者规范化 JSON 的
+      SHA-256——根输入顺序不同但依赖闭包相同的请求得到相同摘要；
+    * 文档 / 修订 / 指针不存在 → ``422`` 及完整引用链；
+      只读接口，成功或失败都不产生任何写入。
+    """
+    # 只读事务（WAL 快照）：本次锁定见到的全部修订相互一致，且不产生任何写入
+    with db.read_transaction(conn):
+        try:
+            locked_roots, snapshots, edges = bundle.lock_bundle(
+                [(root.document_id, root.revision) for root in body.roots],
+                lambda target: _current_revision_or_none(conn, target),
+                lambda target, rev: _revision_content_or_none(conn, target, rev),
+            )
+        except ResolutionError as exc:
+            raise err(exc.status_code, exc.code, chain=exc.chain, **exc.extra)
+
+    # 三部分均已排序去重：闭包相同则规范化 JSON 逐字节相同，摘要即闭包指纹
+    digest = hashlib.sha256(
+        db.canonical(
+            {"roots": locked_roots, "snapshots": snapshots, "edges": edges}
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "roots": locked_roots,
+        "snapshots": snapshots,
+        "edges": edges,
+        "bundle_digest": digest,
     }
 
 
